@@ -1,7 +1,8 @@
 #!/bin/bash
 # ================================================================
 #  n8n Installer · n8n.swmathe.de
-#  Ubuntu 24.04.5 LTS · Docker · PostgreSQL 16 · Traefik SSL
+#  Ubuntu 24.04.5 LTS · Docker · PostgreSQL 16 · Caddy SSL
+#  Caddy läuft bereits auf dem Server – wird als Reverse Proxy genutzt
 #  https://github.com/Horst803/n8n-hetzner-setup
 # ================================================================
 set -euo pipefail
@@ -13,12 +14,14 @@ BLU='\033[0;34m'; NC='\033[0m'
 # Konfiguration
 N8N_DOMAIN="n8n.swmathe.de"
 N8N_DIR="/opt/n8n"
+N8N_PORT="5678"
 TZ="Europe/Berlin"
+CADDY_CONFIG="/etc/caddy/Caddyfile"
 
 echo -e "${BLU}"
 echo "╔══════════════════════════════════════════════╗"
 echo "║   n8n Installer · Ubuntu 24.04 LTS          ║"
-echo "║   Domain: n8n.swmathe.de                    ║"
+echo "║   Domain: n8n.swmathe.de  (via Caddy)       ║"
 echo "╚══════════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -31,9 +34,8 @@ fi
 # Eingaben abfragen
 echo "Bitte folgende Angaben machen:"
 echo ""
-read -p "📧  E-Mail für Let's Encrypt SSL: " LE_EMAIL
-read -p "👤  n8n Admin-Benutzername:        " N8N_USER
-read -s -p "🔒  n8n Admin-Passwort:            " N8N_PASS
+read -p "👤  n8n Admin-Benutzername:  " N8N_USER
+read -s -p "🔒  n8n Admin-Passwort:      " N8N_PASS
 echo ""
 echo ""
 
@@ -41,16 +43,16 @@ echo ""
 PG_PASS=$(openssl rand -hex 24)
 ENC_KEY=$(openssl rand -hex 24)
 
-# ── 1/6 System aktualisieren ─────────────────────────────────
-echo -e "${YLW}[1/6] System aktualisieren...${NC}"
+# ── 1/5 System-Pakete sicherstellen ──────────────────────────
+echo -e "${YLW}[1/5] Abhängigkeiten prüfen...${NC}"
 apt-get update -qq
-apt-get upgrade -y -qq
-apt-get install -y -qq ca-certificates curl gnupg openssl ufw
-echo -e "${GRN}✓ System aktuell${NC}"
+apt-get install -y -qq ca-certificates curl gnupg openssl ufw caddy
+echo -e "${GRN}✓ Alles vorhanden${NC}"
 
-# ── 2/6 Docker installieren ──────────────────────────────────
-echo -e "${YLW}[2/6] Docker installieren...${NC}"
+# ── 2/5 Docker prüfen ────────────────────────────────────────
+echo -e "${YLW}[2/5] Docker prüfen...${NC}"
 if ! command -v docker &>/dev/null; then
+  echo -e "${YLW}Docker nicht gefunden – wird installiert...${NC}"
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
     -o /etc/apt/keyrings/docker.asc
@@ -70,20 +72,12 @@ else
   echo -e "${GRN}✓ Docker bereits vorhanden ($(docker --version | cut -d' ' -f3))${NC}"
 fi
 
-# ── 3/6 Verzeichnisse anlegen ────────────────────────────────
-echo -e "${YLW}[3/6] Verzeichnisse anlegen...${NC}"
-mkdir -p ${N8N_DIR}/{data,postgres,traefik/certs}
-touch ${N8N_DIR}/traefik/certs/acme.json
-chmod 600 ${N8N_DIR}/traefik/certs/acme.json
-echo -e "${GRN}✓ Verzeichnisse erstellt unter ${N8N_DIR}${NC}"
+# ── 3/5 Verzeichnisse & Konfiguration ────────────────────────
+echo -e "${YLW}[3/5] Verzeichnisse und Konfiguration anlegen...${NC}"
+mkdir -p ${N8N_DIR}/{data,postgres}
 
-# ── 4/6 Konfiguration schreiben ──────────────────────────────
-echo -e "${YLW}[4/6] Konfiguration schreiben...${NC}"
-
-# .env
+# .env – alle Secrets
 cat > ${N8N_DIR}/.env << EOF
-N8N_DOMAIN=${N8N_DOMAIN}
-LE_EMAIL=${LE_EMAIL}
 POSTGRES_DB=n8n
 POSTGRES_USER=n8n
 POSTGRES_PASSWORD=${PG_PASS}
@@ -94,67 +88,25 @@ TZ=${TZ}
 EOF
 chmod 600 ${N8N_DIR}/.env
 
-# traefik.yml
-cat > ${N8N_DIR}/traefik/traefik.yml << TRAEFIK
-api:
-  dashboard: false
-log:
-  level: ERROR
-entryPoints:
-  web:
-    address: ":80"
-    http:
-      redirections:
-        entryPoint:
-          to: websecure
-          scheme: https
-          permanent: true
-  websecure:
-    address: ":443"
-certificatesResolvers:
-  letsencrypt:
-    acme:
-      email: ${LE_EMAIL}
-      storage: /certs/acme.json
-      httpChallenge:
-        entryPoint: web
-providers:
-  docker:
-    exposedByDefault: false
-    network: n8n_net
-TRAEFIK
-
-# docker-compose.yml
-cat > ${N8N_DIR}/docker-compose.yml << 'COMPOSE'
+# docker-compose.yml – KEIN Traefik, kein Port 80/443
+# n8n hört nur auf 127.0.0.1:5678 → Caddy leitet weiter
+cat > ${N8N_DIR}/docker-compose.yml << EOF
 services:
-
-  traefik:
-    image: traefik:v3.0
-    container_name: traefik
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./traefik/traefik.yml:/traefik.yml:ro
-      - ./traefik/certs:/certs
-    networks: [n8n_net]
 
   postgres:
     image: postgres:16-alpine
     container_name: n8n_postgres
     restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     env_file: .env
+    environment:
+      POSTGRES_DB: \${POSTGRES_DB}
+      POSTGRES_USER: \${POSTGRES_USER}
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
     volumes:
       - ./postgres:/var/lib/postgresql/data
     networks: [n8n_net]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U \${POSTGRES_USER} -d \${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -167,50 +119,70 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    ports:
+      - "127.0.0.1:${N8N_PORT}:5678"
+    env_file: .env
     environment:
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_PORT: 5432
-      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
-      DB_POSTGRESDB_USER: ${POSTGRES_USER}
-      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_DATABASE: \${POSTGRES_DB}
+      DB_POSTGRESDB_USER: \${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: \${POSTGRES_PASSWORD}
       N8N_HOST: ${N8N_DOMAIN}
       N8N_PROTOCOL: https
       N8N_PORT: 5678
       WEBHOOK_URL: https://${N8N_DOMAIN}/
-      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
-      GENERIC_TIMEZONE: ${TZ}
-      TZ: ${TZ}
-    env_file: .env
+      N8N_ENCRYPTION_KEY: \${N8N_ENCRYPTION_KEY}
+      GENERIC_TIMEZONE: \${TZ}
+      TZ: \${TZ}
     volumes:
       - ./data:/home/node/.n8n
     networks: [n8n_net]
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.n8n.rule=Host(`${N8N_DOMAIN}`)"
-      - "traefik.http.routers.n8n.entrypoints=websecure"
-      - "traefik.http.routers.n8n.tls=true"
-      - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
-      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
 
 networks:
   n8n_net:
     driver: bridge
-COMPOSE
+EOF
 
 echo -e "${GRN}✓ Konfiguration geschrieben${NC}"
 
-# ── 5/6 Firewall ─────────────────────────────────────────────
-echo -e "${YLW}[5/6] Firewall (ufw) einrichten...${NC}"
-ufw allow 22/tcp  comment 'SSH'            > /dev/null
-ufw allow 80/tcp  comment 'HTTP Redirect'  > /dev/null
-ufw allow 443/tcp comment 'HTTPS n8n'      > /dev/null
-ufw --force enable                         > /dev/null
-echo -e "${GRN}✓ Firewall aktiv (Ports: 22, 80, 443)${NC}"
+# ── 4/5 Caddy Reverse Proxy einrichten ───────────────────────
+echo -e "${YLW}[4/5] Caddy Reverse Proxy konfigurieren...${NC}"
 
-# ── 6/6 Container starten ────────────────────────────────────
-echo -e "${YLW}[6/6] n8n starten...${NC}"
+# Prüfen ob der Block schon existiert
+if grep -q "${N8N_DOMAIN}" "${CADDY_CONFIG}" 2>/dev/null; then
+  echo -e "${GRN}✓ Caddy-Eintrag für ${N8N_DOMAIN} bereits vorhanden – übersprungen${NC}"
+else
+  # Sicherheitskopie der aktuellen Caddyfile
+  cp "${CADDY_CONFIG}" "${CADDY_CONFIG}.backup-$(date +%Y%m%d%H%M%S)"
+
+  # n8n-Block ans Ende der Caddyfile anhängen
+  cat >> "${CADDY_CONFIG}" << EOF
+
+# ── n8n · automatisch hinzugefügt ──────────────────
+${N8N_DOMAIN} {
+    reverse_proxy 127.0.0.1:${N8N_PORT}
+}
+EOF
+
+  echo -e "${GRN}✓ Caddy-Eintrag hinzugefügt (Backup: ${CADDY_CONFIG}.backup-*)${NC}"
+fi
+
+# Caddy-Konfiguration testen und neu laden (KEIN Neustart nötig!)
+caddy fmt --overwrite "${CADDY_CONFIG}" 2>/dev/null || true
+caddy validate --config "${CADDY_CONFIG}" 2>/dev/null && \
+  systemctl reload caddy && \
+  echo -e "${GRN}✓ Caddy neu geladen – laufende Dienste nicht unterbrochen${NC}" || \
+  echo -e "${RED}⚠ Caddy-Validierung fehlgeschlagen – manuelle Prüfung nötig${NC}"
+
+# ── 5/5 Container starten ────────────────────────────────────
+echo -e "${YLW}[5/5] n8n starten...${NC}"
 cd ${N8N_DIR}
+
+# Alte fehlerhafte Container aufräumen falls vorhanden
+docker compose down 2>/dev/null || true
+
 docker compose up -d
 
 echo -e "${YLW}Warte auf n8n (max. 2 Min.)...${NC}"
@@ -241,9 +213,11 @@ echo "║  🌐  https://n8n.swmathe.de                     ║"
 echo "║  📁  Daten:   /opt/n8n/data                     ║"
 echo "║  🗄   DB:      /opt/n8n/postgres                 ║"
 echo "║  🔑  Secrets: /opt/n8n/.env                     ║"
+echo "║  🔀  Proxy:   Caddy (kein Traefik)              ║"
 echo "║                                                  ║"
 echo "╠══════════════════════════════════════════════════╣"
-echo "║  SSL-Zertifikat: automatisch (~1-2 Min.)         ║"
+echo "║  SSL: automatisch via Caddy + Let's Encrypt      ║"
+echo "║  Caddy läuft weiter für alle anderen Dienste     ║"
 echo "║  Beim ersten Aufruf: Admin-Account anlegen       ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo -e "${NC}"
